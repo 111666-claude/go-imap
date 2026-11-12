@@ -191,6 +191,14 @@ func (c *Conn) serve() {
 			}
 			break
 		}
+
+		if dec.IsFatal() {
+			// A truncated or rejected literal left the stream without a
+			// reliable frame boundary. Closing is the only way to avoid
+			// interpreting leftover literal bytes as the next command.
+			c.server.logger().Printf("closing connection: %v", dec.Err())
+			break
+		}
 	}
 }
 
@@ -309,6 +317,13 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 			Type: imap.StatusResponseTypeBad,
 			Code: imap.ResponseCodeClientBug,
 			Text: "Syntax error: " + decErr.Message,
+		}
+	} else if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		// A truncated literal or stream: a client protocol error, not a bug.
+		resp = &imap.StatusResponse{
+			Type: imap.StatusResponseTypeBad,
+			Code: imap.ResponseCodeClientBug,
+			Text: "Unexpected end of input",
 		}
 	} else if err != nil {
 		c.server.logger().Printf("handling %v command: %v", name, err)

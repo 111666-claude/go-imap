@@ -70,13 +70,18 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 	}
 
 	if lit.Size() > appendLimit {
-		return &imap.Error{
+		err := &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTooBig,
 			Text: fmt.Sprintf("Literals are limited to %v bytes for this command", appendLimit),
 		}
+		// The body was not read; mark the stream fatal so the connection is
+		// closed instead of resyncing on the literal bytes.
+		lit.Cancel(err)
+		return err
 	}
 	if err := c.acceptLiteral(lit.Size(), nonSync); err != nil {
+		lit.Cancel(err)
 		return err
 	}
 

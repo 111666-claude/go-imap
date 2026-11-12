@@ -59,6 +59,7 @@ type Decoder struct {
 	r         *bufio.Reader
 	side      ConnSide
 	err       error
+	fatal     bool
 	literal   bool
 	crlf      bool
 	listDepth int
@@ -68,6 +69,15 @@ type Decoder struct {
 // NewDecoder creates a new decoder.
 func NewDecoder(r *bufio.Reader, side ConnSide) *Decoder {
 	return &Decoder{r: r, side: side}
+}
+
+// IsFatal reports whether the decoder hit an error that left the input stream
+// without a reliable frame boundary, such as a truncated literal or a literal
+// rejected before its body was consumed. After a fatal error no further
+// command can be safely parsed from the stream and the connection must be
+// closed.
+func (dec *Decoder) IsFatal() bool {
+	return dec.fatal
 }
 
 func (dec *Decoder) mustUnreadByte() {
@@ -93,6 +103,12 @@ func (dec *Decoder) returnErr(err error) bool {
 }
 
 func (dec *Decoder) readByte() (byte, bool) {
+	if dec.fatal {
+		// A truncated or rejected literal left the stream without a reliable
+		// frame boundary: refuse to keep parsing so that leftover bytes cannot
+		// be mistaken for the next command.
+		return 0, false
+	}
 	if dec.MaxSize > 0 && dec.readBytes > dec.MaxSize {
 		return 0, dec.returnErr(fmt.Errorf("imapwire: max size exceeded"))
 	}
@@ -582,8 +598,11 @@ func (dec *Decoder) Literal(ptr *string) bool {
 	}
 	if dec.CheckBufferedLiteralFunc != nil {
 		if err := dec.CheckBufferedLiteralFunc(lit.Size(), nonSync); err != nil {
-			lit.cancel()
-			return false
+			// The literal body is still in the stream and cannot be safely
+			// skipped without risking swallowing the next command, so mark the
+			// decoder fatal and let the caller tear the connection down.
+			lit.Cancel(err)
+			return dec.returnErr(err)
 		}
 	}
 	var sb strings.Builder
@@ -612,7 +631,7 @@ func (dec *Decoder) LiteralReader() (lit *LiteralReader, nonSync, ok bool) {
 	lit = &LiteralReader{
 		dec:  dec,
 		size: size,
-		r:    io.LimitReader(dec.r, size),
+		r:    &literalReader{r: dec.r, remaining: size},
 	}
 	return lit, nonSync, true
 }
@@ -631,6 +650,35 @@ type LiteralReader struct {
 	r    io.Reader
 }
 
+// literalReader feeds exactly remaining bytes of an IMAP literal from the
+// underlying buffered reader.
+//
+// Unlike io.LimitReader it distinguishes a fully-consumed literal from an
+// input that ends in the middle of one: an EOF while bytes are still
+// outstanding is reported as io.ErrUnexpectedEOF instead of io.EOF.
+type literalReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (lr *literalReader) Read(b []byte) (int, error) {
+	if lr.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(b)) > lr.remaining {
+		b = b[:lr.remaining]
+	}
+	n, err := lr.r.Read(b)
+	lr.remaining -= int64(n)
+	if err == io.EOF && lr.remaining > 0 {
+		// The underlying stream ended, either in the same Read that returned
+		// the last available bytes or in a subsequent zero-byte Read, before
+		// the whole literal was received.
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
 func newLiteralReaderFromString(s string) *LiteralReader {
 	return &LiteralReader{
 		size: int64(len(s)),
@@ -645,15 +693,46 @@ func (lit *LiteralReader) Size() int64 {
 func (lit *LiteralReader) Read(b []byte) (int, error) {
 	n, err := lit.r.Read(b)
 	if err == io.EOF {
-		lit.cancel()
+		lit.finish(nil)
+	} else if err != nil {
+		// A truncated literal (or any other read failure) leaves the stream in
+		// an unknown state: there is no reliable frame boundary anymore. Poison
+		// the decoder so that no further command is parsed from leftover bytes.
+		lit.finish(err)
 	}
 	return n, err
 }
 
-func (lit *LiteralReader) cancel() {
+// Discard skips any unread byte belonging to the literal. It must be called
+// when the caller stops reading before the literal is fully consumed but the
+// connection is meant to stay usable. It returns the first read error.
+func (lit *LiteralReader) Discard() error {
+	if lit.dec == nil {
+		return nil
+	}
+	_, err := io.Copy(io.Discard, lit.r)
+	lit.finish(err)
+	return err
+}
+
+// finish releases the decoder's literal state. When err is non-nil the
+// decoder is put in a permanent, fatal state: its input stream can no longer
+// be trusted to be frame-aligned, so no further command may be parsed.
+func (lit *LiteralReader) finish(err error) {
 	if lit.dec == nil {
 		return
 	}
 	lit.dec.literal = false
+	if err != nil {
+		lit.dec.fatal = true
+		lit.dec.returnErr(err)
+	}
 	lit.dec = nil
+}
+
+// Cancel aborts a literal before its body has been fully read. It marks the
+// decoder fatal: because the unread body still occupies the stream, the frame
+// boundary is not recoverable and the connection must be closed.
+func (lit *LiteralReader) Cancel(err error) {
+	lit.finish(err)
 }
